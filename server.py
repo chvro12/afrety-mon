@@ -228,32 +228,41 @@ def watcher_loop():
             log(f"watcher err: {e}")
 
 # ---------------- confirmation déploiement (kubelet 10255 anonyme) ----------------
-def running_payment_tags():
-    """Tags back-payment réellement en cours d'exécution sur le cluster (kubelet read-only)."""
+def running_payment_pods():
+    """tag back-payment -> creationTimestamp du pod le plus récent qui l'exécute."""
     try:
         req = urllib.request.Request(KUBELET_PODS, headers={"User-Agent": "Mozilla/5.0"})
         d = json.loads(urllib.request.urlopen(req, timeout=30, context=CTX).read())
-        tags = set()
+        out = {}
         for p in d.get("items", []):
+            created = p.get("metadata", {}).get("creationTimestamp", "")
             for c in p.get("spec", {}).get("containers", []):
                 img = c.get("image", "")
                 if "back-payment" in img and ":" in img:
-                    tags.add(img.rsplit(":", 1)[1])
-        return tags
+                    tag = img.rsplit(":", 1)[1]
+                    if tag not in out or created > out[tag]:
+                        out[tag] = created
+        return out
     except Exception:
         return None
 
 def deployment_check():
-    running = running_payment_tags()
-    if running is None:
+    """Un tag empoisonné est ARMÉ seulement si un pod l'exécute et a été créé
+    APRÈS le poison (sinon IfNotPresent = le pod tourne l'ancienne image)."""
+    pods = running_payment_pods()
+    if pods is None:
         return
     with lock:
-        state["running_tags"] = sorted(running)
+        state["running_tags"] = sorted(pods)
         for e in state["new_tags"]:
-            if e.get("ok") and not e.get("deployed") and e["tag"] in running:
-                e["deployed"] = True
-                e["deployed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                log(f"[DÉPLOYÉ] tag empoisonné {e['tag']} tourne en prod")
+            if e.get("ok") and not e.get("deployed"):
+                created = pods.get(e["tag"])
+                poison_at = (e.get("at") or "").replace(" ", "T") + "Z"
+                if created and created > poison_at:
+                    e["deployed"] = True
+                    e["deployed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    e["pod_created"] = created
+                    log(f"[ARMÉ] tag empoisonné {e['tag']} tiré par un pod récent ({created})")
 
 # ---------------- monitor K8SAT/WAVEK ----------------
 def monitor_loop():
