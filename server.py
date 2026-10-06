@@ -268,6 +268,7 @@ def deployment_check():
 def monitor_loop():
     log("monitor démarré")
     alerted_k8sat = False
+    app_fail = 0
     while True:
         time.sleep(300)
         try:
@@ -281,6 +282,11 @@ def monitor_loop():
                 headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json",
                          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
             d = json.loads(urllib.request.urlopen(req, timeout=30, context=CTX).read())
+            app_fail = 0
+            with lock:
+                if state.get("app_status") == "down":
+                    log("[APP] myafrety.afrety.sn RÉTABLI")
+                state["app_status"] = "up"
             k8sat = {}
             wavek = None
             for l in d.get("content", []):
@@ -304,6 +310,13 @@ def monitor_loop():
                 with lock:
                     state["wavek"] = {"key": wavek[:20] + "...", "at": time.strftime("%Y-%m-%d %H:%M:%S")}
         except Exception as e:
+            app_fail += 1
+            if app_fail >= 2:
+                with lock:
+                    if state.get("app_status") != "down":
+                        state["app_down_since"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        log(f"[APP] myafrety.afrety.sn INJOIGNABLE ({app_fail} cycles)")
+                    state["app_status"] = "down"
             log(f"monitor err: {e}")
 
 def selfping_loop():
