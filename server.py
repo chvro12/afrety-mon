@@ -6,7 +6,7 @@ AFRETY MON — watcher + poisoner + moniteur (Render, 24/7).
 - Thread selfping : se ping toutes les 10 min (garde le service éveillé, tier gratuit)
 Endpoints: /health  /state?key=  /poison?key=&tag=  /reset?key=
 """
-import json, time, ssl, base64, hmac, hashlib, gzip, io, tarfile, zipfile, os, threading, shutil, urllib.request
+import json, time, ssl, base64, hmac, hashlib, gzip, io, tarfile, zipfile, os, threading, shutil, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------- config (tous les secrets viennent des envVars Render) ----------------
@@ -317,6 +317,19 @@ def monitor_loop():
             if wavek:
                 with lock:
                     state["wavek"] = {"key": wavek[:20] + "...", "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        except urllib.error.HTTPError as e:
+            app_fail += 1
+            if app_fail >= 2:
+                with lock:
+                    state["app_status"] = "down"
+                    if "app_down_since" not in state:
+                        state["app_down_since"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        log(f"[APP] erreur HTTP persistante ({app_fail} cycles)")
+            try:
+                detail = e.read()[:200]
+            except Exception:
+                detail = b""
+            log(f"monitor err: HTTP {e.code} {e.geturl()[:80]} {detail}")
         except Exception as e:
             app_fail += 1
             if app_fail >= 2:
