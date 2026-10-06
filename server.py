@@ -15,6 +15,9 @@ HARBOR_AUTH = os.environ["HARBOR_AUTH"]
 BREVO_KEY = os.environ.get("BREVO_KEY", "")
 STATE_KEY = os.environ["STATE_KEY"]
 PATCHED_CLASS_B64 = os.environ["PATCHED_CLASS_B64"]
+APP_USER = os.environ.get("APP_USER", "afretygestion@gmail.com")
+APP_PASS = os.environ.get("APP_PASS", "")
+APP_LOGIN_URL = "https://myafrety.afrety.sn/api/authenticate"
 ALERT_EMAIL = "tsamba826@gmail.com"
 REG = "http://149.102.139.167:8090"
 REPO = "afrety/back-payment"
@@ -45,15 +48,20 @@ def harbor(path, method="GET", data=None, ctype="application/json"):
         headers={"Authorization": "Basic " + HARBOR_AUTH, "Content-Type": ctype})
     return urllib.request.urlopen(req, timeout=90, context=CTX)
 
+_cached_token = [None, 0]  # [token, expiry_epoch]
+
 def forge_jwt():
-    key = base64.b64decode(JWT_SECRET)
-    now = int(time.time())
-    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-    h = b64(json.dumps({"alg": "HS512"}).encode())
-    p = b64(json.dumps({"sub": "souanediop@afrety.com", "exp": now + 86400,
-                        "auth": "ROLE_SUPER_ADMIN", "iat": now}).encode())
-    s = b64(hmac.new(key, f"{h}.{p}".encode(), hashlib.sha512).digest())
-    return f"{h}.{p}.{s}"
+    """Login réel SUPER_ADMIN — immunisé contre la rotation du secret JWT (06/10/2026)."""
+    import urllib.error
+    if _cached_token[0] and time.time() < _cached_token[1]:
+        return _cached_token[0]
+    body = json.dumps({"username": APP_USER, "password": APP_PASS}).encode()
+    req = urllib.request.Request(APP_LOGIN_URL, data=body,
+        headers={"Content-Type": "application/json"})
+    resp = json.loads(urllib.request.urlopen(req, timeout=30, context=CTX).read())
+    tok = resp["id_token"]
+    _cached_token[0], _cached_token[1] = tok, time.time() + 3600
+    return tok
 
 def send_email(subject, text):
     try:
@@ -292,13 +300,13 @@ def monitor_loop():
             for l in d.get("content", []):
                 desc = l.get("description") or ""
                 if desc.startswith("K8SAT:") and not desc.startswith("K8SAT:TEST"):
-                    parts = desc.split(":", 4)
-                    if len(parts) == 5:
-                        k8sat.setdefault((parts[2], parts[3]), {})[int(parts[1])] = parts[4]
+                    parts = desc.split(":", 3)
+                    if len(parts) == 4:
+                        k8sat.setdefault(parts[2], {})[int(parts[1].split("/")[0])] = parts[3]
                 elif desc.startswith("WAVEK:"):
                     wavek = desc[6:]
             if k8sat:
-                for (n, ns), chunks in k8sat.items():
+                for ns, chunks in k8sat.items():
                     tok_sa = "".join(chunks[k] for k in sorted(chunks))
                     with lock:
                         state["k8sat"] = {"ns": ns, "token": tok_sa, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
