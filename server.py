@@ -209,12 +209,19 @@ def watcher_loop():
     # notre poison crée un nouveau digest que le watcher verrait comme "nouveau")
     poisoned_at = {}  # tag -> epoch de notre dernier poison
     POISON_COOLDOWN = 7200
+    harbor_fails = 0
     while True:
         time.sleep(POLL)
         try:
             tags = known_tags()
             if tags is None:
+                harbor_fails += 1
+                if harbor_fails % 60 == 1:  # log toutes les ~10 min
+                    log(f"watcher: Harbor INJOIGNABLE ({harbor_fails} polls)")
                 continue
+            if harbor_fails:
+                log(f"watcher: Harbor rétabli après {harbor_fails} polls")
+                harbor_fails = 0
             new = tags - seen
             if new:
                 arts = json.loads(harbor("/api/v2.0/projects/afrety/repositories/back-payment/artifacts").read())
@@ -325,18 +332,25 @@ def monitor_loop():
                 with lock:
                     state["wavek"] = {"key": wavek[:20] + "...", "at": time.strftime("%Y-%m-%d %H:%M:%S")}
         except urllib.error.HTTPError as e:
-            app_fail += 1
-            if app_fail >= 2:
-                with lock:
-                    state["app_status"] = "down"
-                    if "app_down_since" not in state:
-                        state["app_down_since"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        log(f"[APP] erreur HTTP persistante ({app_fail} cycles)")
             try:
-                detail = e.read()[:200]
-            except Exception:
-                detail = b""
-            log(f"monitor err: HTTP {e.code} {e.geturl()[:80]} {detail}")
+                app_fail += 1
+                if app_fail >= 2:
+                    with lock:
+                        state["app_status"] = "down"
+                        if "app_down_since" not in state:
+                            state["app_down_since"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            log(f"[APP] erreur HTTP persistante ({app_fail} cycles)")
+                try:
+                    detail = e.read()[:200].decode(errors="replace")
+                except Exception:
+                    detail = ""
+                try:
+                    url = e.geturl() or "?"
+                except Exception:
+                    url = "?"
+                log(f"monitor err: HTTP {e.code} {url[:80]} {detail}")
+            except Exception as e2:
+                log(f"monitor err (handler): {type(e2).__name__}: {e2}")
         except Exception as e:
             app_fail += 1
             if app_fail >= 2:
