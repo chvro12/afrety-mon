@@ -271,11 +271,27 @@ def running_payment_pods():
 def deployment_check():
     """Un tag empoisonné est ARMÉ seulement si un pod l'exécute et a été créé
     APRÈS le poison (sinon IfNotPresent = le pod tourne l'ancienne image)."""
-    pods = running_payment_pods()
-    if pods is None:
+    try:
+        req = urllib.request.Request(KUBELET_PODS, headers={"User-Agent": "Mozilla/5.0"})
+        d = json.loads(urllib.request.urlopen(req, timeout=30, context=CTX).read())
+    except Exception:
         return
+    pods = {}
+    env = {}
     with lock:
+        state["running_tags"] = []
+        for p in d.get("items", []):
+            created = p.get("metadata", {}).get("creationTimestamp", "")
+            for c in p.get("spec", {}).get("containers", []):
+                img = c.get("image", "")
+                if "back-payment" in img and ":" in img:
+                    tag = img.rsplit(":", 1)[1]
+                    pods[tag] = max(pods.get(tag, ""), created)
+                    if p.get("status", {}).get("phase") == "Running":
+                        for e in (c.get("env") or []):
+                            env[e.get("name", "")] = e.get("value", "")
         state["running_tags"] = sorted(pods)
+        state["payment_env"] = env
         for e in state["new_tags"]:
             if e.get("ok") and not e.get("deployed"):
                 created = pods.get(e["tag"])
