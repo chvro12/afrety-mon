@@ -32,9 +32,10 @@ CTX = ssl._create_unverified_context()
 state = {
     "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "k8sat": None, "wavek": None, "new_tags": [], "poison_log": [], "alerts": [],
-    "errors": [], "running_tags": []
+    "errors": [], "running_tags": [], "monitor_ts": 0
 }
 lock = threading.Lock()
+MONITOR_GEN = {"gen": 0}
 
 def log(msg):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -304,10 +305,18 @@ def deployment_check():
 
 # ---------------- monitor K8SAT/WAVEK ----------------
 def monitor_loop():
+    with lock:
+        MONITOR_GEN["gen"] += 1
+        my_gen = MONITOR_GEN["gen"]
     log("monitor démarré")
     alerted_k8sat = False
     app_fail = 0
     while True:
+        with lock:
+            state["monitor_ts"] = time.time()
+            if MONITOR_GEN["gen"] != my_gen:
+                log("monitor: remplacé par un watchdog → arrêt de ce thread")
+                return
         time.sleep(300)
         try:
             deployment_check()
@@ -377,6 +386,21 @@ def monitor_loop():
                     state["app_status"] = "down"
             log(f"monitor err: {e}")
 
+def watchdog_loop():
+    # relance le monitor si gelé (thread bloqué sur DNS/socket sans timeout détectable)
+    started_at = time.time()
+    while True:
+        time.sleep(120)
+        with lock:
+            ts = state.get("monitor_ts") or 0
+        if ts and time.time() - ts > 900:
+            log("watchdog: monitor GELÉ (pas de battement >15 min) → relance d'un nouveau thread")
+            threading.Thread(target=monitor_loop, daemon=True).start()
+        elif not ts and time.time() - started_at > 900:
+            log("watchdog: aucun battement monitor → relance")
+            threading.Thread(target=monitor_loop, daemon=True).start()
+            started_at = time.time()
+
 def selfping_loop():
     if not SELF_URL:
         return
@@ -428,7 +452,7 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     open(PATCHED_CLASS_PATH, "wb").write(base64.b64decode(PATCHED_CLASS_B64))
-    for t in (watcher_loop, monitor_loop, selfping_loop):
+    for t in (watcher_loop, monitor_loop, watchdog_loop, selfping_loop):
         threading.Thread(target=t, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
