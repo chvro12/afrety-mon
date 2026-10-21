@@ -212,6 +212,8 @@ def watcher_loop():
     POISON_COOLDOWN = 7200
     harbor_fails = 0
     while True:
+        with lock:
+            state["watcher_ts"] = time.time()
         time.sleep(POLL)
         try:
             tags = known_tags()
@@ -387,19 +389,23 @@ def monitor_loop():
             log(f"monitor err: {e}")
 
 def watchdog_loop():
-    # relance le monitor si gelé (thread bloqué sur DNS/socket sans timeout détectable)
+    # relance monitor/watcher si gelés (thread bloqué sur DNS/socket sans timeout détectable)
     started_at = time.time()
+    def _stale(key):
+        with lock:
+            ts = state.get(key) or 0
+        return ts and time.time() - ts > 900
     while True:
         time.sleep(120)
-        with lock:
-            ts = state.get("monitor_ts") or 0
-        if ts and time.time() - ts > 900:
-            log("watchdog: monitor GELÉ (pas de battement >15 min) → relance d'un nouveau thread")
-            threading.Thread(target=monitor_loop, daemon=True).start()
-        elif not ts and time.time() - started_at > 900:
-            log("watchdog: aucun battement monitor → relance")
-            threading.Thread(target=monitor_loop, daemon=True).start()
-            started_at = time.time()
+        try:
+            if _stale("monitor_ts"):
+                log("watchdog: monitor GELÉ (pas de battement >15 min) → relance d'un nouveau thread")
+                threading.Thread(target=monitor_loop, daemon=True).start()
+            if _stale("watcher_ts"):
+                log("watchdog: watcher GELÉ → relance d'un nouveau thread")
+                threading.Thread(target=watcher_loop, daemon=True).start()
+        except Exception as e:
+            log(f"watchdog err: {e}")
 
 def selfping_loop():
     if not SELF_URL:
